@@ -127,7 +127,8 @@ async def get_ai_response(user_id: int, user_message: str) -> Optional[str]:
 async def main():
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH, proxy=proxy)
     await client.start()
-    logger.info("Клиент Telegram запущен. Аккаунт: %s", await client.get_me().username)
+    me = await client.get_me()
+    logger.info("Клиент Telegram запущен. Аккаунт: %s", me.username)
 
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
