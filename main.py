@@ -1,12 +1,14 @@
 import os
 import asyncio
 import logging
+import base64
 from collections import deque
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, Any
 
 import socks
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 import aiohttp
 
 load_dotenv()
@@ -16,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== Конфигурация из .env ==========
+# ========== Чтение конфигурации ==========
 API_ID = int(os.getenv('API_ID', 0))
 API_HASH = os.getenv('API_HASH', '')
 SESSION_NAME = os.getenv('SESSION_NAME', 'my_session')
@@ -35,6 +37,11 @@ SYSTEM_PROMPT = os.getenv(
     'Просто дай прямой ответ, не более 30 символов.'
 )
 MAX_HISTORY_MESSAGES = int(os.getenv('MAX_HISTORY_MESSAGES', 10))
+ENABLE_THINKING = os.getenv('ENABLE_THINKING', 'false').lower() == 'true'
+MAX_TOKENS = int(os.getenv('MAX_TOKENS', 100))
+TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
+ONLINE_TIMEOUT = int(os.getenv('ONLINE_TIMEOUT', 30))  # секунд
+VISION_ENABLED = os.getenv('VISION_ENABLED', 'true').lower() == 'true'
 
 # ========== Прокси ==========
 proxy = None
@@ -53,7 +60,11 @@ def get_user_history(user_id: int) -> deque:
         user_histories[user_id] = deque(maxlen=MAX_HISTORY_MESSAGES)
     return user_histories[user_id]
 
-def add_to_history(user_id: int, role: str, content: str):
+def add_to_history(user_id: int, role: str, content: Union[str, List[dict]]):
+    """
+    Добавляет сообщение в историю. content может быть строкой (текст) или списком (multimodal).
+    Для совместимости храним как есть, но для построения запроса будем использовать исходный формат.
+    """
     history = get_user_history(user_id)
     history.append({"role": role, "content": content})
 
@@ -62,29 +73,62 @@ def clear_history(user_id: int):
         user_histories[user_id].clear()
         logger.info(f"История для пользователя {user_id} очищена.")
 
-def build_messages_for_api(history: deque, new_message: str) -> List[dict]:
+def build_messages_for_api(history: deque, new_message_content: Union[str, List[dict]]) -> List[dict]:
     """
     Формирует список сообщений для отправки в API.
     - системный промпт
     - вся история (уже чередующиеся user/assistant)
-    - новое сообщение пользователя (роль user)
+    - новое сообщение пользователя
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(list(history))
-    messages.append({"role": "user", "content": new_message})
+    messages.append({"role": "user", "content": new_message_content})
     return messages
 
-# ========== Запрос к LM Studio (GLM-4.7) ==========
+# ========== Вспомогательные функции для изображений ==========
+async def extract_image_content(event) -> Optional[bytes]:
+    """
+    Извлекает изображение из сообщения, возвращает байты или None.
+    Поддерживает фото и документы-изображения.
+    """
+    if event.photo:
+        # Фото
+        return await event.download_media(bytes)
+    elif event.document and event.document.mime_type and event.document.mime_type.startswith('image/'):
+        # Документ с изображением
+        return await event.download_media(bytes)
+    return None
+
+def create_multimodal_content(text: str, image_bytes: bytes) -> List[dict]:
+    """
+    Создаёт content в формате multimodal: текстовый элемент и изображение в base64.
+    """
+    # Кодируем изображение в base64
+    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+    # Определяем MIME-тип (можно упрощённо взять image/jpeg, но лучше определить)
+    # Для простоты будем считать, что это JPEG; если не подойдёт, модель может не понять.
+    # Можно попытаться определить по магическим числам, но для большинства случаев JPEG подойдёт.
+    mime_type = "image/jpeg"  # можно улучшить
+    content = [
+        {"type": "text", "text": text} if text else None,
+        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}}
+    ]
+    # Убираем пустой текстовый элемент, если текст отсутствует
+    return [item for item in content if item is not None]
+
+# ========== Запрос к LM Studio ==========
 async def get_ai_response_from_messages(messages: List[dict]) -> Optional[str]:
     headers = {"Content-Type": "application/json"}
-    payload = {
+    payload: Dict[str, Any] = {
         "messages": messages,
-        "max_tokens": 100,
-        "temperature": 0.7,
+        "max_tokens": MAX_TOKENS,
+        "temperature": TEMPERATURE,
         "stream": False,
-        "enable_thinking": False,
-        "thinking": {"type": "disabled"}
     }
+    # Добавляем параметры отключения мышления, если нужно
+    if not ENABLE_THINKING:
+        payload["enable_thinking"] = False
+        payload["thinking"] = {"type": "disabled"}
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -99,12 +143,63 @@ async def get_ai_response_from_messages(messages: List[dict]) -> Optional[str]:
                     else:
                         logger.error("Неожиданный формат ответа: %s", data)
                 else:
-                    logger.error("Ошибка HTTP %d", resp.status)
+                    logger.error("Ошибка HTTP %d при запросе к LM Studio", resp.status)
                     error_text = await resp.text()
                     logger.error("Тело ошибки: %s", error_text)
     except Exception as e:
         logger.exception("Исключение при запросе: %s", e)
     return None
+
+# ========== Управление статусом онлайн ==========
+class OnlineStatusManager:
+    def __init__(self, client: TelegramClient, timeout: int):
+        self.client = client
+        self.timeout = timeout
+        self._offline_task: Optional[asyncio.Task] = None
+
+    async def set_online(self):
+        """Включает статус онлайн и отменяет запланированное отключение."""
+        try:
+            await self.client(functions.account.UpdateStatusRequest(offline=False))
+            logger.debug("Статус установлен: онлайн")
+        except Exception as e:
+            logger.error("Не удалось установить онлайн: %s", e)
+
+        # Отменяем предыдущий таймер отключения, если был
+        if self._offline_task and not self._offline_task.done():
+            self._offline_task.cancel()
+            try:
+                await self._offline_task
+            except asyncio.CancelledError:
+                pass
+
+        # Запускаем новый таймер
+        self._offline_task = asyncio.create_task(self._auto_offline())
+
+    async def _auto_offline(self):
+        """Через timeout секунд переводит статус в офлайн."""
+        try:
+            await asyncio.sleep(self.timeout)
+            await self.client(functions.account.UpdateStatusRequest(offline=True))
+            logger.debug("Статус установлен: офлайн (по таймауту)")
+        except asyncio.CancelledError:
+            logger.debug("Таймер отключения отменён")
+        except Exception as e:
+            logger.error("Не удалось установить офлайн: %s", e)
+
+    async def shutdown(self):
+        """При завершении работы принудительно ставим офлайн."""
+        if self._offline_task and not self._offline_task.done():
+            self._offline_task.cancel()
+            try:
+                await self._offline_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await self.client(functions.account.UpdateStatusRequest(offline=True))
+            logger.info("Статус установлен: офлайн (завершение работы)")
+        except Exception as e:
+            logger.error("Не удалось установить офлайн при завершении: %s", e)
 
 # ========== Основная функция ==========
 async def main():
@@ -112,6 +207,9 @@ async def main():
     await client.start()
     me = await client.get_me()
     logger.info("Клиент Telegram запущен. Аккаунт: %s", me.username or me.first_name)
+
+    # Создаём менеджер статуса онлайн
+    online_manager = OnlineStatusManager(client, ONLINE_TIMEOUT)
 
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
@@ -132,28 +230,53 @@ async def main():
 
         logger.info("Новое сообщение от %d: %s", user_id, text[:50])
 
+        # Устанавливаем статус онлайн и сбрасываем таймер
+        await online_manager.set_online()
+
         # Получаем историю пользователя
         history = get_user_history(user_id)
 
-        # Формируем сообщения для API (история + новое сообщение)
-        messages_for_api = build_messages_for_api(history, text)
+        # Проверяем наличие изображения
+        image_bytes = None
+        if VISION_ENABLED and (event.photo or (event.document and event.document.mime_type.startswith('image/'))):
+            try:
+                image_bytes = await extract_image_content(event)
+                logger.info("Изображение получено, размер: %d байт", len(image_bytes) if image_bytes else 0)
+            except Exception as e:
+                logger.error("Ошибка при скачивании изображения: %s", e)
+
+        # Формируем content для нового сообщения
+        if image_bytes and VISION_ENABLED:
+            # Мультимодальное сообщение (текст + картинка)
+            new_content = create_multimodal_content(text, image_bytes)
+        else:
+            # Только текст
+            new_content = text
+
+        # Строим сообщения для API (история + новое сообщение)
+        messages_for_api = build_messages_for_api(history, new_content)
 
         # Показываем статус "печатает"
         async with client.action(event.chat_id, 'typing'):
             ai_response = await get_ai_response_from_messages(messages_for_api)
 
         if ai_response:
-            # Сохраняем и сообщение пользователя, и ответ ассистента в историю
-            add_to_history(user_id, "user", text)
+            # Сохраняем в историю и сообщение пользователя, и ответ ассистента
+            add_to_history(user_id, "user", new_content)
             add_to_history(user_id, "assistant", ai_response)
             await event.reply(ai_response)
             logger.info("Отправлен ответ для %d: %s", user_id, ai_response)
         else:
             await event.reply("...")
             logger.warning("Ответ нейросети не получен для %d, отправлена заглушка")
+            # Не сохраняем ничего в историю, чтобы не нарушить чередование
 
     logger.info("Обработчик сообщений зарегистрирован. Ожидаем сообщения...")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        # При выходе выключаем онлайн
+        await online_manager.shutdown()
 
 if __name__ == '__main__':
     asyncio.run(main())
