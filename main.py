@@ -27,6 +27,8 @@ PROXY_ADDR = os.getenv('PROXY_ADDR')
 PROXY_PORT = int(os.getenv('PROXY_PORT', 0)) if os.getenv('PROXY_PORT') else None
 PROXY_USERNAME = os.getenv('PROXY_USERNAME')
 PROXY_PASSWORD = os.getenv('PROXY_PASSWORD')
+# Добавляем чтение RAW_MODE
+RAW_MODE = os.getenv('RAW_MODE', 'false').lower() == 'true'
 LM_STUDIO_URL = os.getenv('LM_STUDIO_URL', 'http://localhost:1234/v1/chat/completions')
 SYSTEM_PROMPT = os.getenv(
     'SYSTEM_PROMPT',
@@ -76,11 +78,11 @@ def clear_history(user_id: int):
 def build_messages_for_api(history: deque, new_message_content: Union[str, List[dict]]) -> List[dict]:
     """
     Формирует список сообщений для отправки в API.
-    - системный промпт
-    - вся история (уже чередующиеся user/assistant)
-    - новое сообщение пользователя
+    Если RAW_MODE=True, системный промпт НЕ добавляется.
     """
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = []
+    if not RAW_MODE:
+        messages.append({"role": "system", "content": SYSTEM_PROMPT})
     messages.extend(list(history))
     messages.append({"role": "user", "content": new_message_content})
     return messages
@@ -125,10 +127,11 @@ async def get_ai_response_from_messages(messages: List[dict]) -> Optional[str]:
         "temperature": TEMPERATURE,
         "stream": False,
     }
-    # Добавляем параметры отключения мышления, если нужно
-    if not ENABLE_THINKING:
+    # Добавляем параметры отключения мышления только если НЕ raw_mode и мышление выключено
+    if not RAW_MODE and not ENABLE_THINKING:
         payload["enable_thinking"] = False
         payload["thinking"] = {"type": "disabled"}
+    # В raw_mode эти параметры не добавляем, оставляя модель в её естественном состоянии
 
     try:
         async with aiohttp.ClientSession() as session:
