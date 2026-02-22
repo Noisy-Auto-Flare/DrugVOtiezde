@@ -218,6 +218,11 @@ async def main():
     async def handler(event):
         if not event.is_private or event.out:
             return
+        
+        try:
+            await client.send_read_acknowledge(event.chat_id)
+        except Exception as e:
+            logger.warning("Не удалось пометить сообщение как прочитанное: %s", e)
 
         text = event.text.strip()
         user_id = event.sender_id
