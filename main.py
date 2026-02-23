@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import base64
+import random
 from collections import deque
 from typing import Dict, List, Optional, Union, Any
 
@@ -47,6 +48,10 @@ ENABLE_TYPING_DELAY= os.getenv('ENABLE_TYPING_DELAY', 'false').lower() == 'true'
 DELAY_PER_CHAR = float(os.getenv('DELAY_PER_CHAR', 0.05))  # секунд на символ
 MIN_DELAY = float(os.getenv('MIN_DELAY', 1.0))  # минимальная задержка
 MAX_DELAY = float(os.getenv('MAX_DELAY', 5.0))  #
+ENABLE_READING_DELAY = os.getenv('ENABLE_READING_DELAY', 'false').lower() == 'true'
+READING_SPEED = float(os.getenv('READING_SPEED', 20.0))
+THINKING_MIN = float(os.getenv('THINKING_MIN', 0.5))
+THINKING_MAX = float(os.getenv('THINKING_MAX', 1.0))
 
 # ========== Прокси ==========
 proxy = None
@@ -244,6 +249,15 @@ async def main():
             clear_history(user_id)
             await event.reply("История нашего разговора очищена. Начнём заново!")
             return
+        
+        # === ЗАДЕРЖКА НА ЧТЕНИЕ И ОБДУМЫВАНИЕ ===
+        if ENABLE_READING_DELAY and text:
+            reading_time = len(text) / READING_SPEED
+            thinking_time = random.uniform(THINKING_MIN, THINKING_MAX)
+            total_delay = reading_time + thinking_time
+            logger.debug("Задержка на чтение+обдумывание: %.2f сек (чтение: %.2f, обдумывание: %.2f)",
+                        total_delay, reading_time, thinking_time)
+            await asyncio.sleep(total_delay)
 
         logger.info("Новое сообщение от %d: %s", user_id, text[:50])
 
