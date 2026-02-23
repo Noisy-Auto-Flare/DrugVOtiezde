@@ -44,6 +44,10 @@ MAX_TOKENS = int(os.getenv('MAX_TOKENS', 100))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 ONLINE_TIMEOUT = int(os.getenv('ONLINE_TIMEOUT', 30))  # секунд
 VISION_ENABLED = os.getenv('VISION_ENABLED', 'true').lower() == 'true'
+ENABLE_TYPING_DELAY= os.getenv('ENABLE_TYPING_DELAY', 'false').lower() == 'true'
+DELAY_PER_CHAR = float(os.getenv('DELAY_PER_CHAR', 0.05))  # секунд на символ
+MIN_DELAY = float(os.getenv('MIN_DELAY', 1.0))  # минимальная задержка
+MAX_DELAY = float(os.getenv('MAX_DELAY', 5.0))  #
 
 # ========== Прокси ==========
 proxy = None
@@ -229,7 +233,7 @@ async def main():
 
         # Команды
         if text == '/start':
-            await event.reply("Привет! Я твой друг с Тенерифе. Просто напиши мне что-нибудь :)")
+            await event.reply("Привет)")
             return
         if text == '/reset':
             clear_history(user_id)
@@ -240,9 +244,6 @@ async def main():
 
         # Устанавливаем статус онлайн и сбрасываем таймер
         await online_manager.set_online()
-
-        # Получаем историю пользователя
-        history = get_user_history(user_id)
 
         # Проверяем наличие изображения
         image_bytes = None
@@ -261,24 +262,38 @@ async def main():
             # Только текст
             new_content = text
 
+        # Получаем историю пользователя
+        history = get_user_history(user_id)
         # Строим сообщения для API (история + новое сообщение)
         messages_for_api = build_messages_for_api(history, new_content)
 
-        # Показываем статус "печатает"
+        start_time = asyncio.get_event_loop().time()
+
+        # Показываем статус "печатает" (будет активен всё время, пока генерируется ответ и пока длится задержка)
         async with client.action(event.chat_id, 'typing'):
             ai_response = await get_ai_response_from_messages(messages_for_api)
 
+            if ai_response and ENABLE_TYPING_DELAY:
+                elapsed = asyncio.get_event_loop().time() - start_time
+                delay_needed = len(ai_response) * DELAY_PER_CHAR
+                delay_needed = max(MIN_DELAY, min(MAX_DELAY, delay_needed))
+                wait_time = max(0, delay_needed - elapsed)
+                if wait_time > 0:
+                    logger.debug("Дополнительная задержка перед отправкой: %.2f сек", wait_time)
+                    await asyncio.sleep(wait_time)
+
         if ai_response:
-            # Сохраняем в историю и сообщение пользователя, и ответ ассистента
+        # Сохраняем в историю
             add_to_history(user_id, "user", new_content)
             add_to_history(user_id, "assistant", ai_response)
-            await event.reply(ai_response)
-            logger.info("Отправлен ответ для %d: %s", user_id, ai_response)
+            # Отправляем с разбиением
+            await send_long_message(event, ai_response)
+            logger.info("Отправлен ответ для %d (длина %d символов, общая задержка %.2f сек)",
+                    user_id, len(ai_response), asyncio.get_event_loop().time() - start_time)
         else:
             await event.reply("...")
-            logger.warning("Ответ нейросети не получен для %d, отправлена заглушка")
-            # Не сохраняем ничего в историю, чтобы не нарушить чередование
-
+            logger.warning("Ответ нейросети не получен для %d", user_id)
+        
     logger.info("Обработчик сообщений зарегистрирован. Ожидаем сообщения...")
     try:
         await client.run_until_disconnected()
