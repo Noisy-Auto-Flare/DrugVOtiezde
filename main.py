@@ -27,7 +27,6 @@ PROXY_ADDR = os.getenv('PROXY_ADDR')
 PROXY_PORT = int(os.getenv('PROXY_PORT', 0)) if os.getenv('PROXY_PORT') else None
 PROXY_USERNAME = os.getenv('PROXY_USERNAME')
 PROXY_PASSWORD = os.getenv('PROXY_PASSWORD')
-# Добавляем чтение RAW_MODE
 RAW_MODE = os.getenv('RAW_MODE', 'false').lower() == 'true'
 LM_STUDIO_URL = os.getenv('LM_STUDIO_URL', 'http://localhost:1234/v1/chat/completions')
 SYSTEM_PROMPT = os.getenv(
@@ -122,6 +121,20 @@ def create_multimodal_content(text: str, image_bytes: bytes) -> List[dict]:
     # Убираем пустой текстовый элемент, если текст отсутствует
     return [item for item in content if item is not None]
 
+# ========== Функция отправки длинных сообщений (ДОБАВЛЕНА) ==========
+async def send_long_message(event, text: str, chunk_size: int = 4000):
+    """Разбивает длинный текст на части и отправляет их последовательно."""
+    if len(text) <= chunk_size:
+        await event.reply(text)
+        return
+    parts = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    for i, part in enumerate(parts):
+        if i == 0:
+            await event.reply(part)
+        else:
+            await event.client.send_message(event.chat_id, part)
+        await asyncio.sleep(0.5)  # небольшая задержка между частями
+
 # ========== Запрос к LM Studio ==========
 async def get_ai_response_from_messages(messages: List[dict]) -> Optional[str]:
     headers = {"Content-Type": "application/json"}
@@ -131,11 +144,9 @@ async def get_ai_response_from_messages(messages: List[dict]) -> Optional[str]:
         "temperature": TEMPERATURE,
         "stream": False,
     }
-    # Добавляем параметры отключения мышления только если НЕ raw_mode и мышление выключено
     if not RAW_MODE and not ENABLE_THINKING:
         payload["enable_thinking"] = False
         payload["thinking"] = {"type": "disabled"}
-    # В raw_mode эти параметры не добавляем, оставляя модель в её естественном состоянии
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -165,14 +176,12 @@ class OnlineStatusManager:
         self._offline_task: Optional[asyncio.Task] = None
 
     async def set_online(self):
-        """Включает статус онлайн и отменяет запланированное отключение."""
         try:
             await self.client(functions.account.UpdateStatusRequest(offline=False))
             logger.debug("Статус установлен: онлайн")
         except Exception as e:
             logger.error("Не удалось установить онлайн: %s", e)
 
-        # Отменяем предыдущий таймер отключения, если был
         if self._offline_task and not self._offline_task.done():
             self._offline_task.cancel()
             try:
@@ -180,11 +189,9 @@ class OnlineStatusManager:
             except asyncio.CancelledError:
                 pass
 
-        # Запускаем новый таймер
         self._offline_task = asyncio.create_task(self._auto_offline())
 
     async def _auto_offline(self):
-        """Через timeout секунд переводит статус в офлайн."""
         try:
             await asyncio.sleep(self.timeout)
             await self.client(functions.account.UpdateStatusRequest(offline=True))
@@ -195,7 +202,6 @@ class OnlineStatusManager:
             logger.error("Не удалось установить офлайн: %s", e)
 
     async def shutdown(self):
-        """При завершении работы принудительно ставим офлайн."""
         if self._offline_task and not self._offline_task.done():
             self._offline_task.cancel()
             try:
@@ -215,14 +221,13 @@ async def main():
     me = await client.get_me()
     logger.info("Клиент Telegram запущен. Аккаунт: %s", me.username or me.first_name)
 
-    # Создаём менеджер статуса онлайн
     online_manager = OnlineStatusManager(client, ONLINE_TIMEOUT)
 
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
         if not event.is_private or event.out:
             return
-        
+
         try:
             await client.send_read_acknowledge(event.chat_id)
         except Exception as e:
@@ -242,10 +247,9 @@ async def main():
 
         logger.info("Новое сообщение от %d: %s", user_id, text[:50])
 
-        # Устанавливаем статус онлайн и сбрасываем таймер
         await online_manager.set_online()
 
-        # Проверяем наличие изображения
+        # Обработка изображений
         image_bytes = None
         if VISION_ENABLED and (event.photo or (event.document and event.document.mime_type.startswith('image/'))):
             try:
@@ -254,17 +258,12 @@ async def main():
             except Exception as e:
                 logger.error("Ошибка при скачивании изображения: %s", e)
 
-        # Формируем content для нового сообщения
         if image_bytes and VISION_ENABLED:
-            # Мультимодальное сообщение (текст + картинка)
             new_content = create_multimodal_content(text, image_bytes)
         else:
-            # Только текст
             new_content = text
 
-        # Получаем историю пользователя
         history = get_user_history(user_id)
-        # Строим сообщения для API (история + новое сообщение)
         messages_for_api = build_messages_for_api(history, new_content)
 
         start_time = asyncio.get_event_loop().time()
@@ -283,22 +282,19 @@ async def main():
                     await asyncio.sleep(wait_time)
 
         if ai_response:
-        # Сохраняем в историю
             add_to_history(user_id, "user", new_content)
             add_to_history(user_id, "assistant", ai_response)
-            # Отправляем с разбиением
             await send_long_message(event, ai_response)
             logger.info("Отправлен ответ для %d (длина %d символов, общая задержка %.2f сек)",
-                    user_id, len(ai_response), asyncio.get_event_loop().time() - start_time)
+                        user_id, len(ai_response), asyncio.get_event_loop().time() - start_time)
         else:
             await event.reply("...")
             logger.warning("Ответ нейросети не получен для %d", user_id)
-        
+
     logger.info("Обработчик сообщений зарегистрирован. Ожидаем сообщения...")
     try:
         await client.run_until_disconnected()
     finally:
-        # При выходе выключаем онлайн
         await online_manager.shutdown()
 
 if __name__ == '__main__':
